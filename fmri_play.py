@@ -191,8 +191,7 @@ class Logger:
     def save_game_block(self, block_index, game, frames):
         """frames: dict of parallel lists collected during a game block."""
         path = os.path.join(self.outdir, f"block-{block_index:02d}_{game}.npz")
-        np.savez_compressed(
-            path,
+        arrays = dict(
             actions=np.array(frames["action"], dtype=np.int16),
             rewards=np.array(frames["reward"], dtype=np.float32),
             terminal=np.array(frames["terminal"], dtype=bool),
@@ -201,12 +200,24 @@ class Logger:
             t_rel=np.array(frames["t_rel"], dtype=np.float64),
             t_epoch=np.array(frames["t_epoch"], dtype=np.float64),
             ram=np.array(frames["ram"], dtype=np.uint8),
-            # One exact ALE state (pickled clone_state) per episode start, so
-            # every frame is reconstructable offline by replaying actions.
+            # Exact ALE machine state (pickled clone_state) for EVERY frame, so
+            # each frame is independently restorable to a bit-exact screen with
+            # a single step() -- no reliance on deterministic action replay.
+            states=np.array(frames["states"], dtype=object),
+            # One clone_state + seed per episode start (redundant with `states`
+            # but convenient, and the anchor for action-replay reconstruction).
             init_states=np.array(frames["init_states"], dtype=object),
             episode_seeds=np.array(frames["episode_seeds"], dtype=np.int64),
             game=game,
         )
+        # Optional lossless pixels: store the indexed (palettized) screen +
+        # palette. RGB == palette[screen_index] exactly, so this is lossless;
+        # zlib in savez_compressed exploits the large flat regions (~0.1KB/frame
+        # vs ~100KB/frame for raw RGB). Only present if save_pixels was enabled.
+        if frames["screen_index"]:
+            arrays["screen_index"] = np.array(frames["screen_index"], dtype=np.uint8)
+            arrays["palette"] = np.array(frames["palette"], dtype=np.uint8)
+        np.savez_compressed(path, **arrays)
         return path
 
     def save_manifest(self):
@@ -298,6 +309,8 @@ def run_game(display, clock, logger, phase, index):
                       never-ending episode can't stall the session (default 300)
         fps         : target game frames per second (default 30)
         seed        : base RNG seed (default derived from block index)
+        save_pixels : if true, ALSO store the lossless indexed screen per frame.
+                      OFF by default -- see the warning below. (default False)
     """
     game = phase["game"]
     mode = phase.get("mode", "duration")
@@ -305,19 +318,39 @@ def run_game(display, clock, logger, phase, index):
     n_episodes = phase.get("n_episodes", 1)
     fps = phase.get("fps", 30)
     base_seed = phase.get("seed", 1000 + index)
+    save_pixels = phase.get("save_pixels", False)
     dt = 1.0 / fps
     # Hard wall-clock cap so the block always terminates: `duration` in
     # duration mode, else a generous safety limit in episode mode.
     cap = duration if mode == "duration" else phase.get("max_duration", 300.0)
+
+    if save_pixels:
+        # Per-frame full state already makes every frame reconstructable
+        # losslessly and cheaply; saving raw pixels on top is rarely necessary.
+        print("\n" + "!" * 70, file=sys.stderr)
+        print("!! WARNING: save_pixels is ON for block %d (%s)." % (index, game),
+              file=sys.stderr)
+        print("!! This stores the screen for EVERY frame. Even losslessly "
+              "compressed", file=sys.stderr)
+        print("!! this is far larger than the state log, and unnecessary: the "
+              "per-frame", file=sys.stderr)
+        print("!! clone_state already reconstructs every pixel exactly. Only "
+              "enable this", file=sys.stderr)
+        print("!! if a downstream tool truly cannot replay states offline.",
+              file=sys.stderr)
+        print("!" * 70 + "\n", file=sys.stderr)
 
     env = gym.make(game, render_mode="rgb_array", **ENV_KWARGS)
     keymap = build_keymap(env)
 
     frames = {k: [] for k in (
         "action", "reward", "terminal", "lives", "episode_id",
-        "t_rel", "t_epoch", "ram")}
+        "t_rel", "t_epoch", "ram", "states")}
     frames["init_states"] = []
     frames["episode_seeds"] = []
+    frames["screen_index"] = []   # lossless indexed pixels (only if save_pixels)
+    palette = np.zeros((256, 3), dtype=np.uint8)  # index -> RGB, block-wide
+    palette_seen = np.zeros(256, dtype=bool)
 
     onset = clock.rel()
     block_end = time.perf_counter() + cap
@@ -354,6 +387,7 @@ def run_game(display, clock, logger, phase, index):
 
             obs, reward, terminated, truncated, info = env.step(action)
             total_reward += reward
+            ale = env.unwrapped.ale
 
             frames["action"].append(action)
             frames["reward"].append(reward)
@@ -362,7 +396,23 @@ def run_game(display, clock, logger, phase, index):
             frames["episode_id"].append(episode_id)
             frames["t_rel"].append(clock.rel())
             frames["t_epoch"].append(clock.epoch())
-            frames["ram"].append(env.unwrapped.ale.getRAM().copy())
+            frames["ram"].append(ale.getRAM().copy())
+            # Exact machine state for this frame -> independently restorable.
+            frames["states"].append(pickle.dumps(
+                env.unwrapped.clone_state(include_rng=True)))
+
+            if save_pixels:
+                idx = ale.getScreen()          # (210,160) uint8 palette indices
+                frames["screen_index"].append(idx.copy())
+                # Learn any new index->RGB mappings for this block's palette.
+                new = np.unique(idx)
+                new = new[~palette_seen[new]]
+                if new.size:
+                    flat_i = idx.reshape(-1)
+                    flat_c = obs.reshape(-1, 3)
+                    for i in new:
+                        palette[i] = flat_c[flat_i == i][0]
+                        palette_seen[i] = True
 
             display.draw_frame(obs)
 
@@ -375,6 +425,7 @@ def run_game(display, clock, logger, phase, index):
             break
 
     env.close()
+    frames["palette"] = palette  # block-wide index->RGB (only used if save_pixels)
     path = logger.save_game_block(index, game.split("/")[-1], frames)
     logger.log_phase({
         "index": index, "type": "game", "game": game, "mode": mode,
