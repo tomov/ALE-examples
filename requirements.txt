@@ -1,0 +1,4 @@
+ale-py
+gymnasium[atari,other]
+pygame
+numpy
